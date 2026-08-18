@@ -18,8 +18,9 @@ everything that differs per site lives in `.env`.
 
 ```bash
 cd /path/to/humhub                 # the directory holding index.php + protected/
-git clone git@github.com:marc-farre/humhub-server-health-check.git
-cd humhub-server-health-check
+mkdir -p health
+cp health-check.php .env.example .htaccess health/
+cd health
 cp .env.example .env
 chmod 600 .env                     # must stay readable by the PHP user (see below)
 openssl rand -hex 32               # paste into HEALTH_TOKEN
@@ -27,15 +28,15 @@ openssl rand -hex 32               # paste into HEALTH_TOKEN
 
 Edit `.env` — at minimum `HEALTH_TOKEN`. `HUMHUB_PATH` is auto-detected when the
 script sits in the HumHub root or one level below it; set it explicitly if the
-humhub-server-health-check directory lives elsewhere. `BASE_URL` and `HEALTH_LABEL` are worth setting
+health directory lives elsewhere. `BASE_URL` and `HEALTH_LABEL` are worth setting
 too (the label identifies the server in alerts; it defaults to the hostname).
 
 Verify:
 
 ```bash
-/path/to/php humhub-server-health-check/health-check.php -v      # show every check
-/path/to/php humhub-server-health-check/health-check.php --list  # list check ids
-curl -s "https://example.org/humhub-server-health-check/health-check.php?token=…"
+/path/to/php health/health-check.php -v      # show every check
+/path/to/php health/health-check.php --list  # list check ids
+curl -s "https://example.org/health/health-check.php?token=…"
 ```
 
 ### Permissions
@@ -49,17 +50,31 @@ site user, `chmod 600` owned by that user is correct; where PHP runs as
 
 ### Web server protection
 
-The bundled `.htaccess` denies everything in the directory except
-`health-check.php`. HumHub's own root `.htaccess` already denies dotfiles by name
-and that rule is inherited by subdirectories, but relying on it alone breaks as
-soon as the humhub-server-health-check directory moves outside the HumHub root, so ship this file
-too.
+The bundled `.htaccess` denies `.env` and every other non-script file in the
+directory using `FilesMatch` only — no `RewriteRule`. That matters: a
+`RewriteRule` inside a `.htaccess` requires `Options FollowSymLinks` (or
+`SymLinksIfOwnerMatch`) to be granted for that directory, and on hosts that do
+not grant it Apache refuses **every** request in the directory with a 403:
+
+```
+403 Forbidden — "You don't have permission to access the requested object."
+error log: AH00670: Options FollowSymLinks and SymLinksIfOwnerMatch are both off,
+           so the RewriteRule directive is also forbidden
+```
+
+A stricter rule that 404s anything except the script is included but commented
+out, together with the `Options +FollowSymLinks` line it needs. Only enable it if
+you have confirmed it works on your host.
+
+HumHub's own root `.htaccess` also denies dotfiles by name and that rule is
+inherited by subdirectories, so `.env` has a second line of defence when the
+health directory lives inside a HumHub installation.
 
 nginx has no `.htaccess`; add this to the server block instead:
 
 ```nginx
 location ~ /\.                             { deny all; }
-location ~ ^/humhub-server-health-check/(?!health-check\.php$) { deny all; }
+location ~ ^/health/(?!health-check\.php$) { deny all; }
 ```
 
 ## Cron
@@ -78,15 +93,19 @@ when a job stops running (log file older than `CRON_LOG_MAX_AGE_MINUTES`).
 Schedule the health check itself so it only mails you when something is wrong:
 
 ```cron
-*/10 * * * * out=$(/path/to/php /path/to/humhub/humhub-server-health-check/health-check.php 2>&1) || echo "$out"
+*/10 * * * * out=$(/path/to/php /path/to/humhub/health/health-check.php 2>&1) || echo "$out"
 ```
 
 Exit codes: `0` = OK, `1` = warnings only, `2` = errors.
 
 ## External monitor
 
-- **URL**: `https://example.org/humhub-server-health-check/health-check.php?token=…`, or send the
-  token as an `X-Health-Token` / `Authorization: Bearer` header.
+- **Monitor type**: `HTTP(s) - Keyword`, method `GET`, accepted status codes
+  `200-299`.
+- **URL**: `https://example.org/health/health-check.php?token=…`, or leave the
+  token out of the URL and set a header instead:
+  `{ "X-Health-Token": "<HEALTH_TOKEN>" }`. `Authorization: Bearer` also works,
+  but some servers strip that header before PHP sees it.
 - **Accepted status codes**: `200` — errors return `503`. Set
   `HTTP_FAIL_ON_WARNING=true` to make warnings fail too.
 - Or use a **keyword monitor** on `Server health check passed`: the first line is
@@ -94,6 +113,12 @@ Exit codes: `0` = OK, `1` = warnings only, `2` = errors.
   `Server health check FAILED: …`, so the keyword matches while warnings stay
   visible in the response body.
 - `&format=json` returns structured output; `&verbose=1` includes passing checks.
+
+A 403 is always explained in the response body (`no token supplied`,
+`token mismatch`, `client IP … is not in HEALTH_ALLOW_IPS`, or an unreadable
+`.env`). Responses from the script carry an `X-Health-Check: instance` header and
+`Content-Type: text/plain`; an HTML 403 without that header came from the web
+server or a WAF, before PHP ran.
 
 ## How the PHP version comparison works
 
