@@ -728,22 +728,44 @@ if (!$isCli) {
 }
 
 // =============================================================================
-// Resolve paths / HumHub installation
+// Resolve the application: HumHub-aware, or generic for any other PHP app
 // =============================================================================
 
-$humhubPath = $env->str('HUMHUB_PATH');
-if ($humhubPath === '') {
-    // Sensible defaults: this script sits either in the HumHub root or in a
-    // subdirectory of it (e.g. <root>/health/health-check.php).
+// APP_TYPE=humhub  -> HumHub-specific checks are active (default)
+// APP_TYPE=generic -> everything HumHub-specific is either skipped or driven
+//                     purely by configuration, so the script works for any app.
+$appType = strtolower($env->str('APP_TYPE', 'humhub'));
+if (in_array($appType, ['none', 'other', 'plain', 'generic'], true)) {
+    $appType = 'generic';
+} elseif ($appType !== 'humhub') {
+    $appType = 'humhub';
+}
+$isHumhubMode = $appType === 'humhub';
+
+// APP_PATH is the generic name; HUMHUB_PATH is kept as an alias so existing
+// .env files keep working.
+$appPath = $env->str('APP_PATH');
+if ($appPath === '') {
+    $appPath = $env->str('HUMHUB_PATH');
+}
+$appPathConfigured = $appPath !== '';
+if ($appPath === '') {
+    // This script normally sits in the application root or one level below it
+    // (e.g. <root>/health/health-check.php).
     foreach ([__DIR__, dirname(__DIR__), dirname(__DIR__, 2)] as $candidate) {
-        if (is_file($candidate . '/protected/yii')) {
-            $humhubPath = $candidate;
+        if ($isHumhubMode ? is_file($candidate . '/protected/yii') : is_file($candidate . '/index.php')) {
+            $appPath = $candidate;
             break;
         }
     }
 }
-$humhubPath = $humhubPath !== '' ? rtrim(hc_expand_home($humhubPath), '/') : '';
-$hasHumhub = $humhubPath !== '' && is_file($humhubPath . '/protected/yii');
+$appPath = $appPath !== '' ? rtrim(hc_expand_home($appPath), '/') : '';
+
+// Kept under the old names so the check closures read unchanged.
+$humhubPath = $appPath;
+$hasApp = $appPath !== '' && is_dir($appPath);
+$hasHumhub = $isHumhubMode && $appPath !== '' && is_file($appPath . '/protected/yii');
+$appLabel = $env->str('APP_NAME', $isHumhubMode ? 'HumHub' : 'application');
 
 // HumHub version + declared PHP requirements, read from the installation itself.
 $humhubVersion = null;
@@ -770,9 +792,13 @@ $humhubSeries = $humhubVersion !== null ? hc_minor($humhubVersion) : null;
 // timezone) the same way HumHub's own SelfTest compares web vs cron.
 $stateFile = $env->str('HEALTH_STATE_FILE');
 if ($stateFile === '') {
-    $stateFile = ($hasHumhub && is_writable($humhubPath . '/protected/runtime'))
-        ? $humhubPath . '/protected/runtime/health-check-state.json'
-        : sys_get_temp_dir() . '/health-check-state-' . substr(sha1($humhubPath . __DIR__), 0, 10) . '.json';
+    $stateDir = $env->str('HEALTH_STATE_DIR');
+    if ($stateDir === '' && $hasHumhub && is_writable($humhubPath . '/protected/runtime')) {
+        $stateDir = $humhubPath . '/protected/runtime';
+    }
+    $stateFile = ($stateDir !== '' && is_dir($stateDir) && is_writable($stateDir))
+        ? rtrim(hc_expand_home($stateDir), '/') . '/health-check-state.json'
+        : sys_get_temp_dir() . '/health-check-state-' . substr(sha1($appPath . __DIR__), 0, 10) . '.json';
 }
 
 // =============================================================================
@@ -831,15 +857,32 @@ $checks['disk'] = function (Report $r) use ($env, $humhubPath): void {
 };
 
 // --- PHP version vs HumHub ----------------------------------------------------
-$checks['php_version'] = function (Report $r) use ($env, $humhubVersion, $humhubSeries, $humhubMinPhp, $humhubRecommendedPhp): void {
+$checks['php_version'] = function (Report $r) use ($env, $humhubVersion, $humhubSeries, $humhubMinPhp, $humhubRecommendedPhp, $isHumhubMode, $appLabel): void {
     $current = PHP_VERSION;
     $minor = hc_minor($current);
 
-    $matrix = ($humhubSeries !== null && isset(HC_HUMHUB_PHP_MATRIX[$humhubSeries])) ? HC_HUMHUB_PHP_MATRIX[$humhubSeries] : null;
-    $min = $humhubMinPhp ?? ($matrix['min'] ?? $env->str('PHP_MIN_VERSION', '8.2'));
-    $max = $matrix['max'] ?? ($env->str('PHP_MAX_VERSION') ?: null);
+    // The HumHub support matrix only applies in HumHub mode; otherwise the range
+    // comes entirely from PHP_MIN_VERSION / PHP_MAX_VERSION.
+    $matrix = ($isHumhubMode && $humhubSeries !== null && isset(HC_HUMHUB_PHP_MATRIX[$humhubSeries])) ? HC_HUMHUB_PHP_MATRIX[$humhubSeries] : null;
+    $configuredMin = $env->str('PHP_MIN_VERSION');
+    $min = $isHumhubMode
+        ? ($humhubMinPhp ?? ($matrix['min'] ?? ($configuredMin !== '' ? $configuredMin : '8.2')))
+        : $configuredMin;
+    $max = ($isHumhubMode ? ($matrix['max'] ?? null) : null) ?? ($env->str('PHP_MAX_VERSION') ?: null);
     $best = $matrix['best'] ?? [];
-    $label = $humhubVersion !== null ? "HumHub $humhubVersion" : 'HumHub (version unknown)';
+    if (!$isHumhubMode) {
+        $humhubRecommendedPhp = null;
+        if ($min === '' && $max === null) {
+            $r->skip("PHP $current — no PHP_MIN_VERSION/PHP_MAX_VERSION configured, so no range to check.");
+            return;
+        }
+        if ($min === '') {
+            $min = '0';
+        }
+    }
+    $label = $isHumhubMode
+        ? ($humhubVersion !== null ? "HumHub $humhubVersion" : 'HumHub (version unknown)')
+        : $appLabel;
 
     if (version_compare($minor, hc_minor($min), '<')) {
         $r->error("PHP $current is too old for $label (minimum: PHP $min).", 'https://docs.humhub.org/docs/admin/requirements');
@@ -861,19 +904,23 @@ $checks['php_version'] = function (Report $r) use ($env, $humhubVersion, $humhub
 };
 
 // --- Required + recommended extensions ---------------------------------------
-$checks['php_extensions'] = function (Report $r) use ($env): void {
-    // Defaults from https://docs.humhub.org/docs/admin/requirements#extensions
-    $required = $env->list('PHP_REQUIRED_EXTENSIONS', [
+$checks['php_extensions'] = function (Report $r) use ($env, $isHumhubMode, $appLabel): void {
+    // HumHub defaults from https://docs.humhub.org/docs/admin/requirements#extensions
+    // In generic mode nothing is assumed: list what your app needs in
+    // PHP_REQUIRED_EXTENSIONS.
+    $required = $env->list('PHP_REQUIRED_EXTENSIONS', $isHumhubMode ? [
         'gd', 'curl', 'mbstring', 'pdo', 'pdo_mysql', 'zip',
         'exif', 'intl', 'fileinfo', 'json', 'iconv',
-    ]);
-    $recommended = $env->list('PHP_RECOMMENDED_EXTENSIONS', [
-        'openssl', 'sodium', 'xml', 'apcu', 'ldap', 'Zend OPcache',
-    ]);
+    ] : []);
+    $recommended = $env->list('PHP_RECOMMENDED_EXTENSIONS', $isHumhubMode
+        ? ['openssl', 'sodium', 'xml', 'apcu', 'ldap', 'Zend OPcache']
+        : ['Zend OPcache']);
 
     $missing = array_values(array_filter($required, static fn($e) => !extension_loaded($e)));
-    if ($missing !== []) {
-        $r->error('Missing required PHP extension(s): ' . implode(', ', $missing) . '.', 'HumHub will not work correctly without these.');
+    if ($required === []) {
+        $r->skip('No PHP_REQUIRED_EXTENSIONS configured — extension presence not checked.');
+    } elseif ($missing !== []) {
+        $r->error('Missing required PHP extension(s): ' . implode(', ', $missing) . '.', "$appLabel will not work correctly without these.");
     } else {
         $r->ok('All required PHP extensions are loaded (' . implode(', ', $required) . ').');
     }
@@ -883,8 +930,10 @@ $checks['php_extensions'] = function (Report $r) use ($env): void {
         $r->warn('Optional PHP extension(s) not loaded: ' . implode(', ', $missingOpt) . '.', 'sodium = Mercure push, apcu = caching, ldap = LDAP auth, OPcache = performance.');
     }
 
+    $wants = static fn(string $ext): bool => in_array($ext, $required, true) || in_array($ext, $recommended, true);
+
     // Image processing: GD needs JPEG + PNG support, not just to be present.
-    if (extension_loaded('gd')) {
+    if ($wants('gd') && extension_loaded('gd')) {
         $lacking = [];
         if (!function_exists('imagecreatefromjpeg')) {
             $lacking[] = 'JPEG';
@@ -898,7 +947,7 @@ $checks['php_extensions'] = function (Report $r) use ($env): void {
             $r->ok('GD has JPEG and PNG support.');
         }
     }
-    if (!class_exists('Imagick', false) && !class_exists('Gmagick', false)) {
+    if ($wants('gd') && !class_exists('Imagick', false) && !class_exists('Gmagick', false)) {
         $r->warn('Neither ImageMagick nor GraphicsMagick is available.', 'Optional, but gives better image processing than GD.');
     }
 
@@ -911,7 +960,7 @@ $checks['php_extensions'] = function (Report $r) use ($env): void {
     }
 
     // intl / ICU
-    if (extension_loaded('intl')) {
+    if ($wants('intl') && extension_loaded('intl')) {
         $icu = defined('INTL_ICU_VERSION') ? INTL_ICU_VERSION : '0';
         if (version_compare($icu, '4.8.1', '<')) {
             $r->error("ICU version $icu is too old (minimum 4.8.1).");
@@ -922,8 +971,8 @@ $checks['php_extensions'] = function (Report $r) use ($env): void {
         }
     }
 
-    // proc_open is needed for the isolated queue worker.
-    if (!function_exists('proc_open')) {
+    // proc_open is needed for HumHub's isolated queue worker.
+    if ($isHumhubMode && !function_exists('proc_open')) {
         $r->warn('proc_open() is disabled.', 'HumHub needs it for isolated queue jobs; otherwise run queue/run with --isolate=0.');
     }
 };
@@ -1106,9 +1155,37 @@ $checks['temp_dirs'] = function (Report $r) use ($env): void {
 };
 
 // --- HumHub installation present ---------------------------------------------
-$checks['humhub_install'] = function (Report $r) use ($humhubPath, $hasHumhub, $humhubVersion): void {
+$checks['app_install'] = function (Report $r) use ($env, $humhubPath, $hasApp, $hasHumhub, $humhubVersion, $isHumhubMode, $appLabel, $appPathConfigured): void {
+    // Generic mode: only verify what the .env actually declares.
+    if (!$isHumhubMode) {
+        // No APP_PATH at all is a legitimate configuration: the script is being
+        // used for server-level checks only (disk, load, memory, PHP, cron).
+        if (!$appPathConfigured && !$hasApp) {
+            $r->skip('No APP_PATH configured — application-level checks skipped (server checks still run).');
+            return;
+        }
+        if ($humhubPath === '' || !$hasApp) {
+            $r->error('Application directory not found' . ($humhubPath !== '' ? " at '$humhubPath'" : '') . '.', 'Set APP_PATH in .env to the application root.');
+            return;
+        }
+        $r->ok("$appLabel found at $humhubPath.");
+        $required = $env->list('APP_REQUIRED_FILES');
+        if ($required === []) {
+            $r->skip('No APP_REQUIRED_FILES configured — nothing else to verify.');
+            return;
+        }
+        foreach ($required as $rel) {
+            if (file_exists($humhubPath . '/' . ltrim($rel, '/'))) {
+                $r->ok("Present: $rel");
+            } else {
+                $r->error("Missing required file or directory: $rel");
+            }
+        }
+        return;
+    }
+
     if (!$hasHumhub) {
-        $r->error('HumHub installation not found' . ($humhubPath !== '' ? " at '$humhubPath'" : '') . '.', 'Set HUMHUB_PATH in .env to the directory containing index.php and protected/.');
+        $r->error('HumHub installation not found' . ($humhubPath !== '' ? " at '$humhubPath'" : '') . '.', 'Set APP_PATH in .env to the directory containing index.php and protected/ — or set APP_TYPE=generic if this is not a HumHub server.');
         return;
     }
     $r->ok('HumHub ' . ($humhubVersion ?? 'version unknown') . " found at $humhubPath.");
@@ -1132,14 +1209,16 @@ $checks['humhub_install'] = function (Report $r) use ($humhubPath, $hasHumhub, $
 };
 
 // --- HumHub writable directories (file permissions) ---------------------------
-$checks['humhub_permissions'] = function (Report $r) use ($env, $humhubPath, $hasHumhub): void {
-    if (!$hasHumhub) {
-        $r->skip('HumHub path unknown — permission checks skipped.');
+$checks['app_permissions'] = function (Report $r) use ($env, $humhubPath, $hasApp, $hasHumhub, $isHumhubMode): void {
+    if (!$hasApp) {
+        $r->skip('Application path unknown — permission checks skipped.');
         return;
     }
+    // In HumHub mode the defaults come from
     // https://docs.humhub.org/docs/admin/installation#file-permissions plus the
-    // directories HumHub's own SelfTest verifies.
-    $dirs = $env->list('HUMHUB_WRITABLE_DIRS', [
+    // directories HumHub's own SelfTest verifies. In generic mode there are no
+    // defaults: list your own in APP_WRITABLE_DIRS.
+    $defaults = ($isHumhubMode && $hasHumhub) ? [
         'assets',
         'uploads',
         'uploads/file',
@@ -1147,7 +1226,12 @@ $checks['humhub_permissions'] = function (Report $r) use ($env, $humhubPath, $ha
         'protected/config',
         'protected/modules',
         'protected/runtime',
-    ]);
+    ] : [];
+    $dirs = $env->list('APP_WRITABLE_DIRS', $env->list('HUMHUB_WRITABLE_DIRS', $defaults));
+    if ($dirs === []) {
+        $r->skip('No APP_WRITABLE_DIRS configured — writability of application directories not checked.');
+        return;
+    }
     $bad = [];
     foreach ($dirs as $rel) {
         $path = $humhubPath . '/' . trim($rel, '/');
@@ -1161,45 +1245,66 @@ $checks['humhub_permissions'] = function (Report $r) use ($env, $humhubPath, $ha
         foreach ($bad as $problem => $rels) {
             $parts[] = implode(', ', $rels) . " ($problem)";
         }
-        $r->error('HumHub directories are not writable: ' . implode('; ', $parts) . '.', 'https://docs.humhub.org/docs/admin/installation#file-permissions');
+        $r->error(
+            'Application directories are not writable: ' . implode('; ', $parts) . '.',
+            $hasHumhub ? 'https://docs.humhub.org/docs/admin/installation#file-permissions' : 'They must be writable by the PHP user (' . hc_process_user() . ').'
+        );
     } else {
-        $r->ok('All required HumHub directories are writable (' . implode(', ', $dirs) . ').');
+        $r->ok('All required directories are writable (' . implode(', ', $dirs) . ').');
     }
 
-    // Ownership mismatch: works today, breaks on the next file HumHub creates.
-    $owner = hc_owner_name($humhubPath . '/protected/runtime');
+    // Ownership mismatch: works today, breaks on the next file the app creates.
+    $ownerRef = $humhubPath . '/' . ltrim((string) ($dirs[0] ?? ''), '/');
+    if ($hasHumhub) {
+        $ownerRef = $humhubPath . '/protected/runtime';
+    }
+    $owner = hc_owner_name($ownerRef);
     $user = hc_process_user();
     if ($owner !== 'unknown' && $user !== 'unknown' && $owner !== $user) {
-        $r->warn("protected/runtime is owned by '$owner' but PHP runs as '$user'.", 'Writability then depends on group/other bits — fragile. chown the tree to the PHP user.');
+        $r->warn(basename($ownerRef) . " is owned by '$owner' but PHP runs as '$user'.", 'Writability then depends on group/other bits — fragile. chown the tree to the PHP user.');
     }
 
-    if ($env->bool('CHECK_UPDATER_WRITABLE', false)) {
+    if ($env->bool('CHECK_ROOT_WRITABLE', $env->bool('CHECK_UPDATER_WRITABLE', false))) {
         $problem = hc_write_test($humhubPath);
         if ($problem !== null) {
-            $r->warn("HumHub root is not writable ($problem) — the built-in updater will not work.");
+            $r->warn("The application root is not writable ($problem)" . ($hasHumhub ? ' — HumHub\'s built-in updater will not work.' : '.'));
         }
     }
 };
 
 // --- Security-relevant permissions & web exposure -----------------------------
-$checks['security'] = function (Report $r) use ($env, $humhubPath, $hasHumhub, $envLoaded, $envUnreadable, $envFile): void {
-    if ($hasHumhub) {
-        // Files that must not be served by the web server.
-        foreach (['protected/.htaccess' => 'blocks web access to protected/', 'uploads/file/.htaccess' => 'blocks PHP execution in uploads/file'] as $rel => $why) {
-            if (!is_file($humhubPath . '/' . $rel)) {
-                $r->error("Missing $rel ($why).", 'Restore it from the HumHub distribution, or replicate the rule in your nginx/Apache config.');
+$checks['security'] = function (Report $r) use ($env, $humhubPath, $hasApp, $hasHumhub, $envLoaded, $envUnreadable, $envFile): void {
+    // Files whose absence means the web server is not blocking a sensitive path.
+    // HumHub ships these; other apps declare their own in REQUIRED_DENY_FILES.
+    $denyFiles = $hasHumhub
+        ? ['protected/.htaccess' => 'blocks web access to protected/', 'uploads/file/.htaccess' => 'blocks PHP execution in uploads/file']
+        : [];
+    foreach ($env->list('REQUIRED_DENY_FILES') as $rel) {
+        $denyFiles[$rel] = 'declared in REQUIRED_DENY_FILES';
+    }
+    if ($hasApp) {
+        foreach ($denyFiles as $rel => $why) {
+            if (!is_file($humhubPath . '/' . ltrim((string) $rel, '/'))) {
+                $r->error("Missing $rel ($why).", 'Restore it, or replicate the rule in your nginx/Apache configuration.');
             }
         }
-        // dynamic.php holds the DB password.
-        $dynamic = $humhubPath . '/protected/config/dynamic.php';
-        if (is_file($dynamic)) {
-            $perms = hc_perms($dynamic);
+
+        // Config files holding credentials must not be readable by everyone.
+        // dynamic.php holds HumHub's DB password; add your own with
+        // SENSITIVE_FILES=config/db.php,.env.local
+        $sensitive = $env->list('SENSITIVE_FILES', $hasHumhub ? ['protected/config/dynamic.php'] : []);
+        foreach ($sensitive as $rel) {
+            $path = $humhubPath . '/' . ltrim($rel, '/');
+            if (!is_file($path)) {
+                continue;
+            }
+            $perms = hc_perms($path);
             if ($perms !== null && ($perms & 0002)) {
-                $r->error(sprintf('protected/config/dynamic.php is world-writable (%04o).', $perms), 'chmod 600 protected/config/dynamic.php');
+                $r->error(sprintf('%s is world-writable (%04o).', $rel, $perms), "chmod 600 $rel");
             } elseif ($perms !== null && ($perms & 0004)) {
-                $r->warn(sprintf('protected/config/dynamic.php is world-readable (%04o) and contains the DB password.', $perms), 'chmod 600 (or 640 with the web group) is safer on shared hosting.');
+                $r->warn(sprintf('%s is world-readable (%04o) and may contain credentials.', $rel, $perms), 'chmod 600 (or 640 with the web group) is safer on shared hosting.');
             } else {
-                $r->ok(sprintf('protected/config/dynamic.php permissions are %04o.', $perms ?? 0));
+                $r->ok(sprintf('%s permissions are %04o.', $rel, $perms ?? 0));
             }
         }
     }
@@ -1239,7 +1344,7 @@ $checks['security'] = function (Report $r) use ($env, $humhubPath, $hasHumhub, $
 };
 
 // --- Web exposure self-test (outbound HTTP) -----------------------------------
-$checks['web_exposure'] = function (Report $r) use ($env, $isCli, $humhubPath): void {
+$checks['web_exposure'] = function (Report $r) use ($env, $isCli, $humhubPath, $hasHumhub): void {
     $mode = strtolower($env->str('WEB_EXPOSURE_CHECK', 'cli')); // off | cli | always
     if ($mode === 'off') {
         $r->skip('Web exposure self-test disabled.');
@@ -1260,10 +1365,10 @@ $checks['web_exposure'] = function (Report $r) use ($env, $isCli, $humhubPath): 
         $r->skip('cURL unavailable — web exposure self-test skipped.');
         return;
     }
-    $paths = $env->list('WEB_EXPOSURE_PATHS', [
+    $paths = $env->list('WEB_EXPOSURE_PATHS', $hasHumhub ? [
         '/protected/config/dynamic.php',
         '/protected/humhub/config/common.php',
-    ]);
+    ] : []);
     // Also probe this script's own .env. If the path is not configured, derive it
     // from the script location relative to the HumHub root (= the webroot).
     $selfEnvPath = $env->str('WEB_EXPOSURE_ENV_PATH');
@@ -1274,8 +1379,13 @@ $checks['web_exposure'] = function (Report $r) use ($env, $isCli, $humhubPath): 
         $paths[] = $selfEnvPath;
     }
 
+    $paths = array_values(array_unique(array_filter($paths)));
+    if ($paths === []) {
+        $r->skip('No WEB_EXPOSURE_PATHS configured — nothing to probe.');
+        return;
+    }
     $timeout = $env->int('WEB_EXPOSURE_TIMEOUT', 5);
-    foreach (array_unique($paths) as $path) {
+    foreach ($paths as $path) {
         $url = $baseUrl . '/' . ltrim($path, '/');
         $ch = curl_init($url);
         curl_setopt_array($ch, [
@@ -1399,9 +1509,15 @@ $checks['cron'] = function (Report $r) use ($env, $humhubPath, $hasHumhub, $stat
             }
         }
         $hint = $known === []
-            ? 'https://docs.humhub.org/docs/admin/cron-jobs'
+            ? ($hasHumhub ? 'https://docs.humhub.org/docs/admin/cron-jobs' : 'If this application has no scheduled tasks, skip this check with HEALTH_SKIP_CHECKS=cron.')
             : 'Other yii commands found: ' . implode(', ', array_unique($known)) . '. Stale path after a rename or move?';
-        $r->error('No cron jobs found for this installation' . ($hasHumhub ? " ($humhubPath)" : '') . '.', $hint);
+        $message = 'No cron jobs found for this installation' . ($humhubPath !== '' ? " ($humhubPath)" : '') . '.';
+        // Without cron HumHub is broken; another app may legitimately have none.
+        if ($hasHumhub) {
+            $r->error($message, $hint);
+        } else {
+            $r->warn($message, $hint);
+        }
         return;
     }
     if ($foreignJobs !== []) {
@@ -1409,7 +1525,7 @@ $checks['cron'] = function (Report $r) use ($env, $humhubPath, $hasHumhub, $stat
     }
 
     // --- Both HumHub commands must be scheduled -------------------------------
-    foreach ($env->list('CRON_REQUIRED_ACTIONS', ['cron/run', 'queue/run']) as $needed) {
+    foreach ($env->list('CRON_REQUIRED_ACTIONS', $hasHumhub ? ['cron/run', 'queue/run'] : []) as $needed) {
         if (in_array($needed, $yiiActions, true)) {
             $r->ok("Cron job for `$needed` found.");
             continue;
@@ -1571,14 +1687,25 @@ $checks['sapi_consistency'] = function (Report $r) use ($env, $stateFile): void 
 };
 
 // --- HumHub runtime logs ------------------------------------------------------
-$checks['logs'] = function (Report $r) use ($env, $humhubPath, $hasHumhub): void {
-    if (!$hasHumhub) {
-        $r->skip('HumHub path unknown — log checks skipped.');
+$checks['logs'] = function (Report $r) use ($env, $humhubPath, $hasApp, $hasHumhub): void {
+    // LOG_DIR may be absolute, or relative to the application root. HumHub's
+    // default is protected/runtime/logs.
+    $logDir = $env->str('LOG_DIR', $hasHumhub ? 'protected/runtime/logs' : '');
+    if ($logDir === '') {
+        $r->skip('No LOG_DIR configured — log checks skipped.');
         return;
     }
-    $logDir = $humhubPath . '/protected/runtime/logs';
+    $logDir = hc_expand_home($logDir);
+    if (!str_starts_with($logDir, '/')) {
+        if (!$hasApp) {
+            $r->skip('LOG_DIR is relative but the application path is unknown — log checks skipped.');
+            return;
+        }
+        $logDir = $humhubPath . '/' . ltrim($logDir, '/');
+    }
+    $logDir = rtrim($logDir, '/');
     if (!is_dir($logDir)) {
-        $r->skip('No protected/runtime/logs directory.');
+        $r->skip("Log directory '$logDir' does not exist.");
         return;
     }
     $maxMb = $env->int('LOG_MAX_TOTAL_MB', 512);
@@ -1589,12 +1716,12 @@ $checks['logs'] = function (Report $r) use ($env, $humhubPath, $hasHumhub): void
         }
     }
     if ($total > $maxMb * 1024 * 1024) {
-        $r->warn('Log directory holds ' . hc_bytes_human((float) $total) . " (threshold {$maxMb} MB).", 'Rotate or truncate protected/runtime/logs — runaway logs fill the disk.');
+        $r->warn('Log directory holds ' . hc_bytes_human((float) $total) . " (threshold {$maxMb} MB).", "Rotate or truncate $logDir — runaway logs fill the disk.");
     } else {
         $r->ok('Log directory size ' . hc_bytes_human((float) $total) . '.');
     }
 
-    $appLog = $logDir . '/app.log';
+    $appLog = $logDir . '/' . $env->str('LOG_FILE', 'app.log');
     $window = $env->int('LOG_ERROR_WINDOW_MINUTES', 60);
     $threshold = $env->int('LOG_ERROR_THRESHOLD', 25);
     if ($window <= 0 || !is_readable($appLog)) {
@@ -1626,9 +1753,9 @@ $checks['logs'] = function (Report $r) use ($env, $humhubPath, $hasHumhub): void
         }
     }
     if ($count >= $threshold) {
-        $r->warn("$count error entries in app.log within the last $window minute(s) (threshold $threshold).", 'Check protected/runtime/logs/app.log.');
+        $r->warn("$count error entries in " . basename($appLog) . " within the last $window minute(s) (threshold $threshold).", "Check $appLog.");
     } else {
-        $r->ok("$count error entries in app.log within the last $window minute(s).");
+        $r->ok("$count error entries in " . basename($appLog) . " within the last $window minute(s).");
     }
 };
 
@@ -1641,8 +1768,28 @@ if ($opt['list']) {
     exit(0);
 }
 
-$skip = array_map('strtolower', array_merge($env->list('HEALTH_SKIP_CHECKS'), $opt['skip']));
-$only = array_map('strtolower', $opt['only'] !== [] ? $opt['only'] : $env->list('HEALTH_ONLY_CHECKS'));
+// Two checks were renamed when generic (non-HumHub) support was added; accept
+// the old ids so existing .env files and cron lines keep working.
+$idAliases = [
+    'humhub_install' => 'app_install',
+    'humhub_permissions' => 'app_permissions',
+];
+$resolveIds = static function (array $ids) use ($idAliases): array {
+    $out = [];
+    foreach ($ids as $id) {
+        $id = strtolower(trim((string) $id));
+        $out[] = $idAliases[$id] ?? $id;
+    }
+    return $out;
+};
+
+$skip = $resolveIds(array_merge($env->list('HEALTH_SKIP_CHECKS'), $opt['skip']));
+$only = $resolveIds($opt['only'] !== [] ? $opt['only'] : $env->list('HEALTH_ONLY_CHECKS'));
+
+// One switch to drop everything HumHub-specific at once.
+if (!$isHumhubMode && $env->bool('SKIP_APP_CHECKS', false)) {
+    $skip = array_merge($skip, ['app_install', 'app_permissions', 'security', 'web_exposure', 'cron', 'logs']);
+}
 
 foreach ($checks as $id => $check) {
     $report->group($id);
@@ -1680,7 +1827,11 @@ $headline = $errors > 0
 $meta = [
     'label' => $env->str('HEALTH_LABEL', gethostname() ?: 'unknown'),
     'hostname' => gethostname() ?: 'unknown',
-    'humhub_version' => $humhubVersion,
+    'app_type' => $appType,
+    'app_name' => $appLabel,
+    'app_version' => $humhubVersion,
+    'humhub_version' => $humhubVersion, // kept for backwards compatibility
+    'app_path' => $humhubPath !== '' ? $humhubPath : null,
     'humhub_path' => $humhubPath !== '' ? $humhubPath : null,
     'php_version' => PHP_VERSION,
     'php_sapi' => PHP_SAPI,
@@ -1720,10 +1871,13 @@ $paint = static function (string $text, string $state) use ($opt, $colors): stri
 };
 
 echo $paint($headline, $errors > 0 ? Report::ERROR : ($warnings > 0 ? Report::WARNING : Report::OK)) . "\n";
+$appDescriptor = $isHumhubMode
+    ? 'HumHub ' . ($humhubVersion ?? '?')
+    : $appLabel;
 echo sprintf(
-    "%s | HumHub %s | PHP %s (%s, user %s) | %d ok, %d warning(s), %d error(s), %d skipped | %.2fs\n",
+    "%s | %s | PHP %s (%s, user %s) | %d ok, %d warning(s), %d error(s), %d skipped | %.2fs\n",
     $meta['label'],
-    $humhubVersion ?? '?',
+    $appDescriptor,
     PHP_VERSION,
     PHP_SAPI,
     $meta['php_user'],

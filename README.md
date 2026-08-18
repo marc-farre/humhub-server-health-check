@@ -39,6 +39,44 @@ Verify:
 curl -s "https://example.org/health/health-check.php?token=…"
 ```
 
+### Using it for other PHP applications
+
+`APP_TYPE=generic` drops every HumHub assumption. The server-level checks (disk,
+inodes, load, memory, PHP settings, OPcache, temp dirs, cron PHP versions, `.env`
+safety) keep working unchanged, and the application-level ones become
+configuration-driven:
+
+```ini
+APP_TYPE=generic
+APP_NAME="My Symfony app"
+APP_PATH=/var/www/app
+
+APP_REQUIRED_FILES=public/index.php,vendor/autoload.php
+APP_WRITABLE_DIRS=var/cache,var/log
+SENSITIVE_FILES=config/db.php,.env.local
+REQUIRED_DENY_FILES=storage/.htaccess
+LOG_DIR=var/log
+LOG_FILE=prod.log
+
+PHP_MIN_VERSION=8.2
+PHP_MAX_VERSION=8.4
+PHP_REQUIRED_EXTENSIONS=json,mbstring,pdo,pdo_pgsql
+```
+
+Anything left empty is skipped rather than guessed at, so a minimal `.env` with
+just `APP_TYPE=generic` turns the script into a pure server monitor. Omit
+`APP_PATH` entirely for that; `SKIP_APP_CHECKS=true` does the same thing
+explicitly.
+
+In generic mode the `cron` check still earns its keep: it verifies that every
+scheduled PHP command running inside `APP_PATH` uses the same PHP version as the
+web application, which is version-agnostic. `CRON_REQUIRED_ACTIONS` lets you
+require specific console commands (the HumHub default is `cron/run queue/run`).
+
+Two check ids were renamed for this: `humhub_install` → `app_install` and
+`humhub_permissions` → `app_permissions`. The old names still work in
+`HEALTH_SKIP_CHECKS` and `--skip`.
+
 ### Permissions
 
 `.env` holds `HEALTH_TOKEN`, so it must not be world-readable — but it **must**
@@ -185,13 +223,13 @@ version explicitly instead of inferring it.
 | `load` | Load average per core, cgroup-quota aware |
 | `memory` | Available RAM and swap usage |
 | `temp_dirs` | Temp dir and session save path really writable |
-| `humhub_install` | HumHub found, version, `vendor/autoload.php`, `dynamic.php`, `.htaccess` |
-| `humhub_permissions` | The directories HumHub must be able to write, plus ownership sanity |
-| `security` | `protected/.htaccess`, `uploads/file/.htaccess`, `dynamic.php` and `.env` permissions |
+| `app_install` | Application found; in HumHub mode: version, `vendor/autoload.php`, `dynamic.php`, `.htaccess`. Generic: `APP_REQUIRED_FILES` |
+| `app_permissions` | `APP_WRITABLE_DIRS` (HumHub's set by default), plus ownership sanity |
+| `security` | `REQUIRED_DENY_FILES` and `SENSITIVE_FILES` (HumHub's set by default) plus `.env` permissions |
 | `web_exposure` | Fetches sensitive paths over HTTP to prove they are not served |
 | `cron` | Scheduled commands, PHP binaries and their versions, cron log freshness |
 | `sapi_consistency` | Web vs CLI PHP version, OS user and timezone |
-| `logs` | `protected/runtime/logs` size and recent error volume |
+| `logs` | `LOG_DIR` size and recent error volume (HumHub: `protected/runtime/logs`) |
 
 Skip noisy ones with `HEALTH_SKIP_CHECKS` in `.env` or `--skip=id,id`; run a
 single one with `--only=id`.
